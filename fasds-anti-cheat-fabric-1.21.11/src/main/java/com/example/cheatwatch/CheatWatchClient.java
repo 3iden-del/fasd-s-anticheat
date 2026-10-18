@@ -1,0 +1,352 @@
+package com.example.cheatwatch;
+
+import com.mojang.blaze3d.platform.InputConstants;
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.minecraft.ChatFormatting;
+import net.minecraft.client.KeyMapping;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.player.AbstractClientPlayer;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.util.Mth;
+import net.minecraft.world.effect.MobEffects;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.BedBlock;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
+import org.lwjgl.glfw.GLFW;
+
+import java.util.*;
+
+/**
+ * fasd's Anti Cheat: a CLIENT-SIDE heuristic cheat spotter.
+ * It only uses what the server already tells your client about other players
+ * (position, swing animation, hurt animation, held item, effects).
+ * It cannot see other players' packets or their client brand.
+ */
+public class CheatWatchClient implements ClientModInitializer {
+
+    // ---- tuning ----
+    static final double REPORT_VL = 3.0;       // VL needed before a player shows up in the report
+    static final double DECAY_PER_TICK = 0.004; // VL fades over time
+    static final boolean AUTO_ALERT = false;   // true = also print a chat line the first time someone crosses REPORT_VL
+    static final double WATCH_RANGE = 96.0;
+
+    private final Map<UUID, Track> tracks = new HashMap<>();
+    private final Set<String> alerted = new HashSet<>();
+    private int now = 0;
+    private KeyMapping reportKey, clearKey;
+
+    @Override
+    public void onInitializeClient() {
+        reportKey = KeyBindingHelper.registerKeyBinding(
+                new KeyMapping("key.fasds_anti_cheat.report", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_K, KeyMapping.Category.MISC));
+        clearKey = KeyBindingHelper.registerKeyBinding(
+                new KeyMapping("key.fasds_anti_cheat.clear", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_J, KeyMapping.Category.MISC));
+        ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
+    }
+
+    // =====================================================================
+    private void onTick(Minecraft mc) {
+        if (mc.level == null || mc.player == null) {
+            tracks.clear();
+            alerted.clear();
+            return;
+        }
+        now++;
+        ClientLevel level = mc.level;
+
+        while (reportKey.consumeClick()) report(mc);
+        while (clearKey.consumeClick()) {
+            tracks.clear();
+            alerted.clear();
+            mc.player.displayClientMessage(Component.literal("[fasd's Anti Cheat] Cleared all flags.").withStyle(ChatFormatting.GRAY), false);
+        }
+
+        List<AbstractClientPlayer> players = new ArrayList<>();
+        for (AbstractClientPlayer p : level.players()) {
+            if (p == mc.player || p.isRemoved()) continue;
+            if (p.distanceTo(mc.player) > WATCH_RANGE) continue;
+            players.add(p);
+        }
+
+        // pass 1: movement + swing bookkeeping
+        for (AbstractClientPlayer p : players) {
+            Track t = tracks.computeIfAbsent(p.getUUID(), k -> new Track());
+            t.name = p.getName().getString();
+            movementChecks(level, p, t);
+        }
+        // pass 2: combat checks (need every player's state updated first)
+        for (AbstractClientPlayer p : players) {
+            Track t = tracks.get(p.getUUID());
+            combatChecks(players, p, t);
+        }
+
+        // decay + cleanup
+        Set<UUID> present = new HashSet<>();
+        for (AbstractClientPlayer p : players) present.add(p.getUUID());
+        for (Iterator<Map.Entry<UUID, Track>> it = tracks.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<UUID, Track> e = it.next();
+            Track t = e.getValue();
+            t.vl.replaceAll((c, v) -> Math.max(0, v - DECAY_PER_TICK));
+            if (!present.contains(e.getKey()) && t.vl.values().stream().allMatch(v -> v < 0.01)) it.remove();
+        }
+
+        if (AUTO_ALERT) {
+            for (Track t : tracks.values()) {
+                for (Map.Entry<Cheat, Double> e : t.vl.entrySet()) {
+                    String key = t.name + e.getKey();
+                    if (e.getValue() >= REPORT_VL && alerted.add(key)) {
+                        mc.player.displayClientMessage(Component.literal("[fasd's Anti Cheat] " + t.name + " may be using " + e.getKey().label)
+                                .withStyle(ChatFormatting.RED), false);
+                    }
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    private void movementChecks(ClientLevel level, AbstractClientPlayer p, Track t) {
+        double x = p.getX(), y = p.getY(), z = p.getZ();
+        if (!t.has) {
+            t.has = true;
+            t.px = x; t.py = y; t.pz = z;
+            t.lastHeadYaw = p.getYHeadRot();
+            return;
+        }
+        double dx = x - t.px, dy = y - t.py, dz = z - t.pz;
+        double h = Math.sqrt(dx * dx + dz * dz);
+        t.px = x; t.py = y; t.pz = z;
+
+        // teleport / pearl / respawn: ignore and reset
+        if (dx * dx + dy * dy + dz * dz > 25) {
+            t.resetMovement();
+            return;
+        }
+
+        // ---- bookkeeping for exemptions ----
+        if (p.hurtTime > 0) t.lastHurt = now;
+        if (p.isInWater() || p.isInLava()) t.lastWater = now;
+        if (holdingSpecial(p)) t.lastSpecial = now;
+        BlockState under = level.getBlockState(BlockPos.containing(x, y - 0.2, z));
+        if (under.getBlock().getFriction() > 0.62f) t.lastSlip = now;
+        if (under.is(Blocks.SLIME_BLOCK) || under.getBlock() instanceof BedBlock) t.lastBounce = now;
+
+        boolean exempt = p.isSpectator() || p.isCreative() || p.isPassenger() || p.isFallFlying()
+                || p.isAutoSpinAttack() || p.isSleeping() || p.isDeadOrDying();
+        boolean recent = now - t.lastHurt < 40 || now - t.lastSpecial < 100
+                || now - t.lastWater < 20 || now - t.lastBounce < 60;
+        boolean feetBlocked = !level.getBlockState(p.blockPosition()).isAir(); // webs, water, vines, bushes...
+        boolean onGround = p.onGround();
+
+        if (exempt || recent) {
+            t.resetMovement();
+            t.wasGround = onGround;
+            // keep swing/yaw bookkeeping alive below
+        } else {
+            // ---------------- SPEED ----------------
+            boolean slip = now - t.lastSlip < 20;
+            if (p.onClimbable() || slip || feetBlocked) {
+                t.winN = 0;
+            } else {
+                t.win[t.winI++ % 10] = h;
+                t.winN = Math.min(t.winN + 1, 10);
+                if (t.winN == 10) {
+                    double sum = 0;
+                    for (double d : t.win) sum += d;
+                    double avg = sum / 10.0;
+                    double limit = 0.45;
+                    if (p.hasEffect(MobEffects.SPEED)) {
+                        limit *= 1.0 + 0.2 * (p.getEffect(MobEffects.SPEED).getAmplifier() + 1);
+                    }
+                    if (avg > limit && now - t.lastFlag.getOrDefault(Cheat.SPEED, -1000) >= 10) {
+                        flag(t, Cheat.SPEED, 1.0, String.format("%.2f b/s (limit %.2f)", avg * 20, limit * 20));
+                    }
+                }
+            }
+
+            boolean canFlyCheck = !p.onClimbable() && !feetBlocked && !p.hasEffect(MobEffects.LEVITATION)
+                    && !p.hasEffect(MobEffects.JUMP_BOOST);
+
+            // ---------------- FLY / HOVER / SPIDER ----------------
+            if (!onGround && canFlyCheck) {
+                if (Math.abs(dy) < 0.005) t.hoverTicks++; else t.hoverTicks = 0;
+                if (dy > 0.02) t.ascendTicks++; else t.ascendTicks = 0;
+                if (t.hoverTicks >= 10 && t.hoverTicks % 10 == 0) flag(t, Cheat.FLY, 1.0, "hovering in mid-air");
+                if (t.ascendTicks >= 10 && t.ascendTicks % 10 == 0) flag(t, Cheat.FLY, 1.0, "rising for " + t.ascendTicks + " ticks");
+            } else {
+                t.hoverTicks = 0;
+                t.ascendTicks = 0;
+            }
+
+            // ---------------- HIGH JUMP ----------------
+            if (t.wasGround && !onGround) {
+                t.airStartY = t.py - dy; // y just before leaving the ground
+                t.flaggedJump = false;
+            }
+            if (!onGround && canFlyCheck && !t.flaggedJump) {
+                double rise = y - t.airStartY;
+                if (rise > 1.6) {
+                    t.flaggedJump = true;
+                    flag(t, Cheat.HIGH_JUMP, 1.5, String.format("rose %.2f blocks (vanilla ~1.25)", rise));
+                }
+            }
+            if (onGround) t.flaggedJump = false;
+
+            // ---------------- JESUS ----------------
+            BlockState below = level.getBlockState(BlockPos.containing(x, y - 0.2, z));
+            boolean onWaterSurface = below.is(Blocks.WATER) && !p.isInWater() && !feetBlocked;
+            if (onWaterSurface && h > 0.08 && Math.abs(dy) < 0.01) t.jesusTicks++; else t.jesusTicks = 0;
+            if (t.jesusTicks >= 8 && t.jesusTicks % 8 == 0) flag(t, Cheat.JESUS, 1.0, "moving across the water surface");
+
+            t.wasGround = onGround;
+        }
+    }
+
+    // =====================================================================
+    private void combatChecks(List<AbstractClientPlayer> players, AbstractClientPlayer p, Track t) {
+        boolean swingStart = p.swinging && (!t.prevSwinging || p.swingTime < t.prevSwingTime);
+        t.prevSwinging = p.swinging;
+        t.prevSwingTime = p.swingTime;
+
+        float yaw = p.getYHeadRot();
+        float yawDelta = Math.abs(Mth.wrapDegrees(yaw - t.lastHeadYaw));
+        t.lastHeadYaw = yaw;
+
+        if (p.isSpectator() || p.isCreative()) return;
+
+        // ---------------- AUTOCLICK (swing rate) ----------------
+        if (swingStart) {
+            t.swingTicks[t.swingI++ % 16] = now;
+            t.swingCount = Math.min(t.swingCount + 1, 16);
+            int inWindow = 0;
+            for (int i = 0; i < t.swingCount; i++) if (now - t.swingTicks[i] <= 40) inWindow++;
+            // the game only shows a new swing every ~3 ticks at best, so 10+ in 2s means constant max-rate spam
+            if (inWindow >= 10 && now - t.lastFlag.getOrDefault(Cheat.AUTOCLICK, -1000) >= 40) {
+                flag(t, Cheat.AUTOCLICK, 0.75, inWindow + " swings in 2s (could be a fast legit clicker)");
+            }
+        }
+
+        // nearest other player
+        AbstractClientPlayer nearest = null;
+        double best = Double.MAX_VALUE;
+        for (AbstractClientPlayer q : players) {
+            if (q == p) continue;
+            double d = q.getBoundingBox().distanceToSqr(p.getEyePosition());
+            if (d < best) { best = d; nearest = q; }
+        }
+
+        // ---------------- KILLAURA ----------------
+        if (nearest != null && p.swinging) {
+            double dist = Math.sqrt(best);
+            // snap aim while fighting
+            if (swingStart && yawDelta > 75 && dist < 6) {
+                flag(t, Cheat.KILLAURA, 0.5, String.format("aim snapped %.0f° in 1 tick", yawDelta));
+            }
+            // hit someone who is behind them
+            Track qt = tracks.get(nearest.getUUID());
+            if (swingStart && dist < 3.5 && nearest.hurtTime >= 7 && qt != null) {
+                Vec3 look = lookVec(p);
+                Vec3 to = nearest.getBoundingBox().getCenter().subtract(p.getEyePosition()).normalize();
+                if (look.dot(to) < -0.17) { // more than ~100 degrees off
+                    flag(t, Cheat.KILLAURA, 1.5, "hit a player who was behind them");
+                }
+            }
+        }
+
+        // ---------------- REACH ----------------
+        // victim just got hurt this tick -> find who was swinging at them
+        if (p.hurtTime >= 9 && t.prevHurtTime < 9) {
+            AbstractClientPlayer attacker = null;
+            double bestD = Double.MAX_VALUE;
+            for (AbstractClientPlayer a : players) {
+                if (a == p || !a.swinging || a.swingTime > 3) continue;
+                double d = p.getBoundingBox().distanceToSqr(a.getEyePosition());
+                if (d < bestD && d < 64) { bestD = d; attacker = a; }
+            }
+            if (attacker != null && meleeItem(attacker.getMainHandItem()) && !attacker.isPassenger()) {
+                double dist = Math.sqrt(bestD);
+                Vec3 look = lookVec(attacker);
+                Vec3 to = p.getBoundingBox().getCenter().subtract(attacker.getEyePosition()).normalize();
+                Track at = tracks.get(attacker.getUUID());
+                if (at != null && dist > 4.0 && look.dot(to) > 0.7) {
+                    flag(at, Cheat.REACH, 1.0, String.format("hit from %.2f blocks (vanilla 3.0)", dist));
+                }
+            }
+        }
+        t.prevHurtTime = p.hurtTime;
+    }
+
+    // =====================================================================
+    private static Vec3 lookVec(AbstractClientPlayer p) {
+        double yaw = Math.toRadians(p.getYHeadRot());
+        double pitch = Math.toRadians(p.getXRot());
+        return new Vec3(-Math.sin(yaw) * Math.cos(pitch), -Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch));
+    }
+
+    private static String itemPath(ItemStack s) {
+        return BuiltInRegistries.ITEM.getKey(s.getItem()).getPath();
+    }
+
+    /** Only blame reach on real melee swings (not thrown items, bows, spears with extra range, etc). */
+    private static boolean meleeItem(ItemStack s) {
+        if (s.isEmpty()) return true;
+        String n = itemPath(s);
+        return n.endsWith("_sword") || n.endsWith("_axe") || n.endsWith("_shovel") || n.endsWith("_hoe") || n.equals("mace");
+    }
+
+    /** Items that can legitimately launch/boost someone: wind charge, mace, trident, firework, pearl, spears. */
+    private static boolean holdingSpecial(AbstractClientPlayer p) {
+        for (ItemStack s : new ItemStack[]{p.getMainHandItem(), p.getOffhandItem()}) {
+            if (s.is(Items.WIND_CHARGE) || s.is(Items.MACE) || s.is(Items.TRIDENT)
+                    || s.is(Items.FIREWORK_ROCKET) || s.is(Items.ENDER_PEARL)
+                    || itemPath(s).contains("spear")) return true;
+        }
+        return false;
+    }
+
+    private void flag(Track t, Cheat c, double amount, String detail) {
+        t.vl.merge(c, amount, Double::sum);
+        t.lastFlag.put(c, now);
+        t.detail.put(c, detail);
+    }
+
+    // =====================================================================
+    private void report(Minecraft mc) {
+        List<Track> flagged = new ArrayList<>();
+        for (Track t : tracks.values()) {
+            if (t.vl.values().stream().anyMatch(v -> v >= REPORT_VL)) flagged.add(t);
+        }
+        var chat = mc.player;
+        chat.displayClientMessage(Component.literal("===== fasd's Anti Cheat report =====").withStyle(ChatFormatting.GOLD), false);
+        if (flagged.isEmpty()) {
+            chat.displayClientMessage(Component.literal("No one looks suspicious right now.").withStyle(ChatFormatting.GREEN), false);
+            return;
+        }
+        flagged.sort((a, b) -> Double.compare(total(b), total(a)));
+        for (Track t : flagged) {
+            int kinds = (int) t.vl.values().stream().filter(v -> v >= REPORT_VL).count();
+            String level = kinds >= 3 ? "VERY LIKELY hacking" : kinds == 2 ? "LIKELY hacking" : "suspicious";
+            ChatFormatting col = kinds >= 3 ? ChatFormatting.DARK_RED : kinds == 2 ? ChatFormatting.RED : ChatFormatting.YELLOW;
+            chat.displayClientMessage(Component.literal(t.name + " - " + level).withStyle(col, ChatFormatting.BOLD), false);
+            for (Map.Entry<Cheat, Double> e : t.vl.entrySet()) {
+                if (e.getValue() < REPORT_VL) continue;
+                chat.displayClientMessage(Component.literal(String.format("  %s (vl %.1f) - %s",
+                        e.getKey().label, e.getValue(), t.detail.getOrDefault(e.getKey(), e.getKey().desc)))
+                        .withStyle(ChatFormatting.GRAY), false);
+            }
+        }
+        chat.displayClientMessage(Component.literal("Heuristic only - lag and odd mechanics can cause false flags.")
+                .withStyle(ChatFormatting.DARK_GRAY, ChatFormatting.ITALIC), false);
+    }
+
+    private static double total(Track t) {
+        return t.vl.values().stream().mapToDouble(Double::doubleValue).sum();
+    }
+}
